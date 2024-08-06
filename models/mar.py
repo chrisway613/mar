@@ -15,13 +15,16 @@ from models.diffloss import DiffLoss
 
 def mask_by_order(mask_len, order, bsz, seq_len):
     masking = torch.zeros(bsz, seq_len).cuda()
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
+    masking = torch.scatter(
+        masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
+    
     return masking
 
 
 class MAR(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
+
     def __init__(self, img_size=256, vae_stride=16, patch_size=1,
                  encoder_embed_dim=1024, encoder_depth=16, encoder_num_heads=16,
                  decoder_embed_dim=1024, decoder_depth=16, decoder_num_heads=16,
@@ -63,14 +66,17 @@ class MAR(nn.Module):
 
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
-        self.mask_ratio_generator = stats.truncnorm((mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
+        self.mask_ratio_generator = stats.truncnorm(
+            (mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25)
 
         # --------------------------------------------------------------------------
         # MAR encoder specifics
-        self.z_proj = nn.Linear(self.token_embed_dim, encoder_embed_dim, bias=True)
+        self.z_proj = nn.Linear(self.token_embed_dim,
+                                encoder_embed_dim, bias=True)
         self.z_proj_ln = nn.LayerNorm(encoder_embed_dim, eps=1e-6)
         self.buffer_size = buffer_size
-        self.encoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_embed_dim))
+        self.encoder_pos_embed_learned = nn.Parameter(torch.zeros(
+            1, self.seq_len + self.buffer_size, encoder_embed_dim))
 
         self.encoder_blocks = nn.ModuleList([
             Block(encoder_embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
@@ -79,16 +85,19 @@ class MAR(nn.Module):
 
         # --------------------------------------------------------------------------
         # MAR decoder specifics
-        self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=True)
+        self.decoder_embed = nn.Linear(
+            encoder_embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        self.decoder_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_embed_dim))
+        self.decoder_pos_embed_learned = nn.Parameter(torch.zeros(
+            1, self.seq_len + self.buffer_size, decoder_embed_dim))
 
         self.decoder_blocks = nn.ModuleList([
             Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
                   proj_drop=proj_dropout, attn_drop=attn_dropout) for _ in range(decoder_depth)])
 
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.diffusion_pos_embed_learned = nn.Parameter(torch.zeros(1, self.seq_len, decoder_embed_dim))
+        self.diffusion_pos_embed_learned = nn.Parameter(
+            torch.zeros(1, self.seq_len, decoder_embed_dim))
 
         self.initialize_weights()
 
@@ -136,6 +145,7 @@ class MAR(nn.Module):
         x = x.reshape(bsz, c, h_, p, w_, p)
         x = torch.einsum('nchpwq->nhwcpq', x)
         x = x.reshape(bsz, h_ * w_, c * p ** 2)
+        
         return x  # [n, l, d]
 
     def unpatchify(self, x):
@@ -147,6 +157,7 @@ class MAR(nn.Module):
         x = x.reshape(bsz, h_, w_, c, p, p)
         x = torch.einsum('nhwcpq->nchpwq', x)
         x = x.reshape(bsz, c, h_ * p, w_ * p)
+        
         return x  # [n, c, h, w]
 
     def sample_orders(self, bsz):
@@ -157,40 +168,59 @@ class MAR(nn.Module):
             np.random.shuffle(order)
             orders.append(order)
         orders = torch.Tensor(np.array(orders)).cuda().long()
+        
         return orders
 
     def random_masking(self, x, orders):
         # generate token mask
-        bsz, seq_len, embed_dim = x.shape
+        bsz, seq_len, _ = x.shape
+        # 从截断的正态分布中采样出 mask 比例
         mask_rate = self.mask_ratio_generator.rvs(1)[0]
         num_masked_tokens = int(np.ceil(seq_len * mask_rate))
         mask = torch.zeros(bsz, seq_len, device=x.device)
+        # 因为 orders 是随机的 tokens 次序, 所以计算出需要 mask 的 token 数量后,
+        # 将 orders 前面这么多数量的 tokens 掩盖掉即实现了随机 mask 的效果
         mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
                              src=torch.ones(bsz, seq_len, device=x.device))
+        
         return mask
 
     def forward_mae_encoder(self, x, mask, class_embedding):
+        # 将最后一维映射到 encoder embedding dim
         x = self.z_proj(x)
-        bsz, seq_len, embed_dim = x.shape
+        bsz, _, embed_dim = x.shape
 
-        # concat buffer
-        x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
+        # 提前预留出 64(即 `buffer_size`) 个 [cls] tokens 的位置, 初始化为 0, 拼接在原 token 序列前面
+        x = torch.cat([torch.zeros(bsz, self.buffer_size,
+                      embed_dim, device=x.device), x], dim=1)
+        # mask 也要相应拓展, 值为 0 表示 [cls] tokens 均不会被 mask
+        mask_with_buffer = torch.cat(
+            [torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
 
         # random drop class embedding during training
+        # CFG 的那套玩法, 在训练时以一定概率 drop 掉条件项(此处以 `fake_latent` 作为无条件的表示),
+        # 从而实现有条件噪声与无条件噪声估计的训练
         if self.training:
             drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
-            drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
-            class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_embedding
+            drop_latent_mask = drop_latent_mask.unsqueeze(
+                -1).cuda().to(x.dtype)
+            class_embedding = drop_latent_mask * self.fake_latent + \
+                (1 - drop_latent_mask) * class_embedding
 
+        # 将 [cls] tokens 放到序列的前 64 个位置
         x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
 
         # encoder position embedding
         x = x + self.encoder_pos_embed_learned
+        # 过一层 LayerNorm
         x = self.z_proj_ln(x)
 
         # dropping
-        x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, embed_dim)
+        # 仅拿 unmasked tokens 喂给 encoder
+        x = x[(1-mask_with_buffer).nonzero(as_tuple=True)
+              ].reshape(bsz, -1, embed_dim)
+
+        ''' encoder 编码 '''
 
         # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -199,22 +229,33 @@ class MAR(nn.Module):
         else:
             for block in self.encoder_blocks:
                 x = block(x)
+                
+        # 最后过一个归一化层
         x = self.encoder_norm(x)
 
         return x
 
     def forward_mae_decoder(self, x, mask):
-
+        # 将最后一维映射为 decoder embedding dim
         x = self.decoder_embed(x)
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
+        # 对原始 mask 拓展出 64 个 [cls] tokens 的位置, 值为 0 表示它们均不被 mask
+        mask_with_buffer = torch.cat(
+            [torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
 
         # pad mask tokens
-        mask_tokens = self.mask_token.repeat(mask_with_buffer.shape[0], mask_with_buffer.shape[1], 1).to(x.dtype)
+        # 由于 masked 仅仅是1个维度为 decoder embedding dim 的向量,
+        # 因此要进行维度的扩展(在 batch 和 sequence 维度进行复制)
+        mask_tokens = self.mask_token.repeat(
+            mask_with_buffer.shape[0], mask_with_buffer.shape[1], 1).to(x.dtype)
+        # 先全部初始化为 masked tokens, 而后把 encoder 的编码结果放到 unmasked 部分
         x_after_pad = mask_tokens.clone()
-        x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = \
+            x.reshape(x.shape[0] * x.shape[1], x.shape[2])
 
         # decoder position embedding
         x = x_after_pad + self.decoder_pos_embed_learned
+
+        ''' decoder 解码 '''
 
         # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -223,65 +264,109 @@ class MAR(nn.Module):
         else:
             for block in self.decoder_blocks:
                 x = block(x)
+                
+        # 经过一个归一化层
         x = self.decoder_norm(x)
 
+        # 去掉 [cls] tokens 所对应的解码结果
         x = x[:, self.buffer_size:]
+        # 最后再加上另一个位置编码(与前面的位置编码不同)
         x = x + self.diffusion_pos_embed_learned
+        
         return x
 
     def forward_loss(self, z, target, mask):
         bsz, seq_len, _ = target.shape
-        target = target.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        z = z.reshape(bsz*seq_len, -1).repeat(self.diffusion_batch_mul, 1)
-        mask = mask.reshape(bsz*seq_len).repeat(self.diffusion_batch_mul)
+        
+        # 之所以要在个数上复制 `diffusion_batch_mul` 这么多倍,
+        # 是为了实现在每个时间步下采样多次从而达到充分训练的效果, 如论文中所述
+        target = target.reshape(
+            bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        z = z.reshape(bsz * seq_len, -1).repeat(self.diffusion_batch_mul, 1)
+        mask = mask.reshape(bsz * seq_len).repeat(self.diffusion_batch_mul)
+        
         loss = self.diffloss(z=z, target=target, mask=mask)
         return loss
 
     def forward(self, imgs, labels):
 
-        # class embed
+        # class embed (B, D)
         class_embedding = self.class_emb(labels)
 
-        # patchify and mask (drop) tokens
+        ''' patchify and mask (drop) tokens '''
+
+        # (B, C, H, W) -> (B, l = (H // P) * (W // P), C x P x P)
         x = self.patchify(imgs)
+        # 相当于 x_0, 作为扩散模型训练的 gt, 根据 noise schedule 加噪可得 x_t
         gt_latents = x.clone().detach()
+        # 对每个样本单独打乱 tokens 次序, 结合以下从而做到随机 mask 的效果
         orders = self.sample_orders(bsz=x.size(0))
+        # 计算 mask 比例 r%, mask 掉以上 orders 中前 r% 位置的 tokens
+        # 由于 orders 是随机顺序, 因此实现了随机 mask 的效果
         mask = self.random_masking(x, orders)
 
+        ''' MAE encode & decode '''
+
         # mae encoder
+        # 在 token 序列前 pad 上 64 个 [cls] tokens,
+        # 然后与 unmasked tokens 一起(加上位置编码)进入到 encoder 进行编码
         x = self.forward_mae_encoder(x, mask, class_embedding)
 
         # mae decoder
+        # 将 encoder 的编码结果与 masked tokens 一起(再次加上位置编码)进行解码,
+        # 解码后去掉 64 个 [cls] tokens 对应的解码结果(最后再加一次位置编码).
         z = self.forward_mae_decoder(x, mask)
 
         # diffloss
+        # 与常规扩散模型的 loss 计算类似, 这里是对 `gt_latents` 加噪得到 x_t,
+        # 然后将 x_t, t, z 输入扩散模型去估计噪声, 采用与真实噪声的 MSE 进行训练,
+        # 但是 loss 只取 masked tokens 所对应的部分
         loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
 
         return loss
 
     def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
 
-        # init and sample generation orders
+        ''' init and sample generation orders '''
+        
+        # 一开始 mask 掉所有 tokens
         mask = torch.ones(bsz, self.seq_len).cuda()
+        # 虽然初始 token 设为 0, 但由于一开始全被 mask 掉, 因此实际上是 64 个 [cls] tokens 和 `self.mask_token` 
+        # 分别在 encoder 和 decoder 起作用
         tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
+        # 采样前先确定采样次序
         orders = self.sample_orders(bsz)
 
         indices = list(range(num_iter))
         if progress:
             indices = tqdm(indices)
-        # generate latents
+            
+        ''' generate latents '''
+        
+        # 自回归迭代
         for step in indices:
             cur_tokens = tokens.clone()
 
-            # class embedding and CFG
+            ''' class embedding and CFG '''
+            
+            # 含 label 的条件生成
             if labels is not None:
                 class_embedding = self.class_emb(labels)
+            # 无条件生成
             else:
                 class_embedding = self.fake_latent.repeat(bsz, 1)
+            
+            # w CFG
+            # CFG 在采样时需要同时估计含 label 的条件噪声和无条件噪声,
+            # 于是需要将 class embedding & fake latent 拼起来并且将
+            # tokens 和 mask 都复制多一倍样本以便让网络同时估计两种情况下的噪声
             if not cfg == 1.0:
                 tokens = torch.cat([tokens, tokens], dim=0)
-                class_embedding = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
+                class_embedding = torch.cat(
+                    [class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
                 mask = torch.cat([mask, mask], dim=0)
+
+            ''' MAE encode & decode '''
 
             # mae encoder
             x = self.forward_mae_encoder(tokens, mask, class_embedding)
@@ -291,37 +376,61 @@ class MAR(nn.Module):
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
+            # 根据 mask 比例和序列长度计算需要被 mask 掉的 token 数量
+            mask_len = torch.Tensor(
+                [np.floor(self.seq_len * mask_ratio)]).cuda()
 
             # masks out at least one for the next iteration
             mask_len = torch.maximum(torch.Tensor([1]).cuda(),
                                      torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
 
-            # get masking for next iteration and locations to be predicted in this iteration
+            ''' get masking for next iteration and locations to be predicted in this iteration '''
+            
+            # 设置下一轮 masked tokens 的位置
             mask_next = mask_by_order(mask_len[0], orders, bsz, self.seq_len)
+            
+            # 计算本轮需要预测的 tokens 对应在序列的哪些位置
             if step >= num_iter - 1:
+                # 若本轮是最后一轮, 则需要预测的 tokens 位置就是之前 mask 掉的所有位置
                 mask_to_pred = mask[:bsz].bool()
             else:
-                mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
-            mask = mask_next
+                # 本轮是 masked(=True) 但下一轮是 unmasked(=False) 的位置即为本轮需要预测的 tokens 位置
+                # 使用 XOR(亦或) 操作即可实现
+                mask_to_pred = torch.logical_xor(
+                    mask[:bsz].bool(), mask_next.bool())
+            
+            # CFG 需要多复制一倍样本
             if not cfg == 1.0:
                 mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+            
+            mask = mask_next
 
             # sample token latents for this step
+            # 取出本轮预测的 tokens
             z = z[mask_to_pred.nonzero(as_tuple=True)]
+            
             # cfg schedule follow Muse
             if cfg_schedule == "linear":
-                cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
+                # 1 ~ `cfg`
+                cfg_iter = 1 + (cfg - 1) * (self.seq_len -
+                                            mask_len[0]) / self.seq_len
             elif cfg_schedule == "constant":
                 cfg_iter = cfg
             else:
                 raise NotImplementedError
+            
+            # 扩散模型采样生成
             sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
+            # w CFG
             if not cfg == 1.0:
-                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)  # Remove null class samples
+                # CFG 情况下, 样本多复制了一倍, 因此取出采样结果的一半即为目标
+                sampled_token_latent, _ = sampled_token_latent.chunk(
+                    2, dim=0)  # Remove null class samples
                 mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
 
-            cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
+            # 将采样结果放到序列对应的位置
+            cur_tokens[mask_to_pred.nonzero(
+                as_tuple=True)] = sampled_token_latent
             tokens = cur_tokens.clone()
 
         # unpatchify

@@ -8,6 +8,7 @@ from diffusion import create_diffusion
 
 class DiffLoss(nn.Module):
     """Diffusion Loss"""
+
     def __init__(self, target_channels, z_channels, depth, width, num_sampling_steps, grad_checkpointing=False):
         super(DiffLoss, self).__init__()
         self.in_channels = target_channels
@@ -20,16 +21,23 @@ class DiffLoss(nn.Module):
             grad_checkpointing=grad_checkpointing
         )
 
-        self.train_diffusion = create_diffusion(timestep_respacing="", noise_schedule="cosine")
-        self.gen_diffusion = create_diffusion(timestep_respacing=num_sampling_steps, noise_schedule="cosine")
+        self.train_diffusion = create_diffusion(
+            timestep_respacing="", noise_schedule="cosine")
+        self.gen_diffusion = create_diffusion(
+            timestep_respacing=num_sampling_steps, noise_schedule="cosine")
 
     def forward(self, target, z, mask=None):
-        t = torch.randint(0, self.train_diffusion.num_timesteps, (target.shape[0],), device=target.device)
+        t = torch.randint(0, self.train_diffusion.num_timesteps,
+                          (target.shape[0],), device=target.device)
         model_kwargs = dict(c=z)
-        loss_dict = self.train_diffusion.training_losses(self.net, target, t, model_kwargs)
+
+        loss_dict = self.train_diffusion.training_losses(
+            self.net, target, t, model_kwargs)
         loss = loss_dict["loss"]
+        # 仅取 masked tokens 所对应的 loss
         if mask is not None:
             loss = (loss * mask).sum() / mask.sum()
+
         return loss.mean()
 
     def sample(self, z, temperature=1.0, cfg=1.0):
@@ -60,6 +68,7 @@ class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
+
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -80,14 +89,17 @@ class TimestepEmbedder(nn.Module):
         :return: an (N, D) Tensor of positional embeddings.
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+            -math.log(max_period) * torch.arange(start=0,
+                                                 end=half, dtype=torch.float32) / half
         ).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
@@ -122,7 +134,8 @@ class ResBlock(nn.Module):
         )
 
     def forward(self, x, y):
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
+            y).chunk(3, dim=-1)
         h = modulate(self.in_ln(x), shift_mlp, scale_mlp)
         h = self.mlp(h)
         return x + gate_mlp * h
@@ -132,9 +145,11 @@ class FinalLayer(nn.Module):
     """
     The final layer of DiT.
     """
+
     def __init__(self, model_channels, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(model_channels, elementwise_affine=False, eps=1e-6)
+        self.norm_final = nn.LayerNorm(
+            model_channels, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(model_channels, out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -145,6 +160,7 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
+        
         return x
 
 
@@ -241,8 +257,10 @@ class SimpleMLPAdaLN(nn.Module):
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, c)
-        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        eps, rest = model_out[:,
+                              :self.in_channels], model_out[:, self.in_channels:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
+
         return torch.cat([eps, rest], dim=1)
